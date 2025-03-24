@@ -1,36 +1,197 @@
-import os
-import sqlite3
 import base64
-import subprocess
-from datetime import datetime
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    Response,
-    render_template,
-)
-from common.encrypt import Encrypter
-from dotenv import load_dotenv
-from flask_cors import CORS
+from datetime import datetime, timedelta, timezone
+import io
 import json
+import os
+import re
+import sqlite3
+import subprocess
+from flask import (
+    Blueprint,
+    Flask,
+    send_file,
+    render_template,
+    send_from_directory,
+    request,
+    Response,
+)
+
+# from dotenv import load_dotenv
+from lib.encrypt import Encrypter
+
+with open("/etc/secrets/kek/key", "r") as f:
+    key = f.read()
+
+with open("/etc/secrets/kek/iv", "r") as f:
+    iv = f.read()
 
 app = Flask(__name__)
-CORS(app)
-load_dotenv()
 
-mega_root = os.getenv("mega_root")
-db_file = os.path.join(mega_root, "database.db")
-encrypter = Encrypter(
-    key=base64.b64decode(os.getenv("key")), iv=base64.b64decode(os.getenv("iv"))
-)
+bp = Blueprint("homevids", __name__)
+
+encrypter = Encrypter(key=base64.b64decode(key), iv=base64.b64decode(iv))
+
+db_file = os.path.join(app.static_folder, "database_dan.db")
+
+
+@bp.route("/video/<path:filename>")
+def video(filename):
+    print(f"pulling next file: {filename}")
+
+    raw_filestem = os.path.splitext(filename.replace("_part0", ""))[0]
+
+    # if exists on disk, send it; else download from server
+    cached_file_location = os.path.join(app.static_folder, "cache", raw_filestem)
+    if os.path.exists(os.path.join(cached_file_location, filename)):
+        print(f"pulled file {filename} from cache")
+        return send_from_directory(cached_file_location, filename)
+
+    # Handle range requests for streaming
+    range_header = request.headers.get("Range")
+    file_size = None  # Will need to get actual size if possible
+
+    # Get streaming response from download_from_server
+    response = Response(
+        download_from_server(filename),
+        status=206 if range_header else 200,
+        mimetype=(
+            "application/x-mpegURL" if filename.endswith(".m3u8") else "video/MP2T"
+        ),
+        direct_passthrough=True,
+    )
+
+    response.headers["Accept-Ranges"] = "bytes"
+    if range_header and file_size:
+        response.headers["Content-Range"] = f"bytes 0-{file_size-1}/{file_size}"
+
+    return response
+
+
+def _images_including_people(cursor, selected_names, per_page, offset):
+    query = f"""
+        SELECT v.filename, v.timestamp
+        FROM video v
+        JOIN video_people vp ON v.id = vp.video_id
+        JOIN people p ON vp.people_id = p.id
+        WHERE p.name IN ({', '.join('?' for _ in selected_names)})
+        GROUP BY v.id
+        HAVING COUNT(DISTINCT p.id) = ?
+    """
+    cursor.execute(
+        f"{query} ORDER BY v.timestamp DESC LIMIT ? OFFSET ?",
+        (*selected_names, len(selected_names), per_page, offset),
+    )
+    images = cursor.fetchall()
+
+    cursor.execute(
+        f"select count(*) from ({query})", (*selected_names, len(selected_names))
+    )
+    count = cursor.fetchone()[0]
+
+    return images, count
+
+
+def _images_with_only_people(cursor, selected_names, per_page, offset):
+    name_placeholder = ", ".join("?" for _ in selected_names)
+
+    cursor.execute(
+        f"select id from people where name in ({name_placeholder})", selected_names
+    )
+    selected_ids = [row[0] for row in cursor.fetchall()]
+
+    query = f"""
+        WITH people_videos AS (
+            SELECT video_id
+            FROM video_people
+            WHERE people_id IN ({name_placeholder})
+            GROUP BY video_id
+            HAVING COUNT(DISTINCT people_id) = (SELECT COUNT(*) FROM people WHERE id IN ({name_placeholder}))
+        ),
+        exact_match_videos AS (
+            SELECT vp.video_id
+            FROM video_people vp
+            JOIN people_videos pv ON vp.video_id = pv.video_id
+            GROUP BY vp.video_id
+            HAVING COUNT(DISTINCT vp.people_id) = (SELECT COUNT(*) FROM people WHERE id IN ({name_placeholder}))
+        )
+        SELECT v.filename, v.timestamp
+        FROM video v
+        JOIN exact_match_videos emv ON v.id = emv.video_id
+    """
+
+    cursor.execute(
+        f"{query} ORDER BY v.timestamp DESC LIMIT ? OFFSET ?",
+        (*selected_ids, *selected_ids, *selected_ids, per_page, offset),
+    )
+    images = cursor.fetchall()
+
+    cursor.execute(
+        f"select count(*) from ({query})", (*selected_ids, *selected_ids, *selected_ids)
+    )
+    count = cursor.fetchone()[0]
+
+    return images, count
+
+
+@bp.route("/", methods=["GET", "POST"])
+def index():
+    print(request.form.to_dict())
+    selected_names = [
+        name for name in request.form.get("selected_name_list", "").split(",") if name
+    ]
+    page = int(request.form.get("page", 1))
+
+    per_page = 20
+    offset = (page - 1) * per_page
+
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+
+    if selected_names:
+        if "Only" in selected_names:
+            images, total_images = _images_with_only_people(
+                cursor, [x for x in selected_names if x != "Only"], per_page, offset
+            )
+        else:
+            images, total_images = _images_including_people(
+                cursor, selected_names, per_page, offset
+            )
+    else:
+        cursor.execute(
+            "SELECT filename, timestamp FROM video order by timestamp desc LIMIT ? OFFSET ?",
+            (per_page, offset),
+        )
+        images = cursor.fetchall()
+
+        cursor.execute("SELECT COUNT(*) FROM video")
+        total_images = cursor.fetchone()[0]
+
+    total_pages = (total_images // per_page) + (
+        1 if total_images % per_page != 0 else 0
+    )
+
+    cursor.execute("SELECT name from people")
+    people = ["Only"] + [person[0] for person in cursor.fetchall()]
+
+    conn.close()
+
+    return render_template(
+        "index.html",
+        images=images,
+        page=page,
+        total_pages=total_pages,
+        people=people,
+        selected_names=",".join(selected_names),
+    )
+
+
+@bp.route("/<path:filename>")
+def videos(filename):
+    return render_template("video.html", filestem=os.path.splitext(filename)[0])
 
 
 def trace_callback(query):
     print("executing query: ", query)
-
-
-thumbnails_by_date = {}
 
 
 def db_fetch(query, parameters=(), *, fetch_type="all", fetch_count=None):
@@ -49,212 +210,93 @@ def db_fetch(query, parameters=(), *, fetch_type="all", fetch_count=None):
                 return cursor.fetchmany(fetch_count)
 
 
-def setup_caches():
-    records = db_fetch(
-        """
-        SELECT 
-            strftime('%Y-%m-%d', unix_timestamp, 'unixepoch', 'localtime', '+9 hours') AS date, 
-            COUNT(*) AS count 
-        FROM 
-            v_distinct_files 
-        GROUP BY 
-            date;
-    """
+def generate_upload_path(server_dek, timestamp, video_filestem):
+    # on mega, video contents is stored in the directory:
+    # /year_hash/month_hash/day_hash/video_filestem_hash/
+    # note that files that make up the video contents aren't necessarily
+    # stored on the same server.
+    # year/month/day hashes are hashed based on the server's email as well as kek
+    # so that each server has different folder names.
+
+    hash_section = lambda x: encrypter.hash(x, iv=server_dek)[:6]
+
+    dt = datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=9)))
+    return os.path.join(
+        *[
+            hash_section(f"{dt.year}"),
+            hash_section(f"{dt.year}/{dt.month}"),
+            hash_section(
+                f"{dt.year}/{dt.month}/{dt.day}"
+            ),  # don't want the month/day hashes to match within multiple year directories
+            hash_section(video_filestem),
+        ]
     )
 
-    for record in records:
-        dt = datetime.strptime(record["date"], "%Y-%m-%d")
-        if dt.year not in thumbnails_by_date:
-            thumbnails_by_date[dt.year] = []
-        thumbnails_by_date[dt.year].append({record["date"]: record["count"]})
 
-
-setup_caches()
-
-
-@app.route("/", methods=("GET",))
-def index():
-    return render_template("thumbnails.html")
-
-
-@app.route("/distinct_years", methods=("GET",))
-def distinct_years():
-    ret = json.dumps(list(thumbnails_by_date.keys()))
-    print(ret)
-    return ret
-
-
-@app.route("/files_by_day", methods=("GET",))
-def files_by_day():
-    year = int(request.args.get("year"))
-    return json.dumps({year: thumbnails_by_date[year]})
-
-
-@app.route("/thumbnails", methods=("GET",))
-def thumbnails():
-    target_date = request.args.get("targetDate")
-    offset = request.args.get("fromIndex")
-    limit = request.args.get("limit")
-
-    # TODO input validation
-
-    records = db_fetch(
-        """
-        select 
-            filename,
-            strftime('%Y-%m-%d', unix_timestamp, 'unixepoch', 'localtime', '+9 hours') as date
-        from 
-            v_distinct_files 
-        WHERE unix_timestamp <= strftime('%s', ? || ' 00:00:00 -09:00')
-        order by unix_timestamp DESC
-        limit ? offset ?;""",
-        (target_date, limit, offset),
-    )
-
-    images = []
-    for record in records:
-        filepath = os.path.join(
-            app.static_folder, "thumbnails", f"{record['filename']}.jpg"
+def download_from_server(filename):
+    if filename.endswith(".m3u8"):
+        file_stem = os.path.splitext(filename)[0]
+        server_name, server_password, server_dek, timestamp, video_dek = db_fetch(
+            """
+                SELECT s.email, s.mega_pw, s.dek, v."timestamp", v.dek
+                FROM server s
+                JOIN playlist p ON p.server_id = s.id
+                JOIN video v ON p.video_id = v.id
+                WHERE v.filename = ?;
+            """,
+            (file_stem,),
+            fetch_type="one",
         )
-        with open(filepath, "rb") as image_file:
-            b64 = base64.b64encode(image_file.read()).decode("utf-8")
 
-        images.append([os.path.basename(filepath)[:-4], b64])
+    elif filename.endswith(".ts"):
+        file_stem, chunk_id = re.match(r"(.+)_part(\d+)\.ts", filename).groups()
+        server_name, server_password, server_dek, timestamp, video_dek = db_fetch(
+            """
+                SELECT s.email, s.mega_pw, s.dek, v."timestamp", v.dek
+                FROM server s
+                JOIN video_chunk vc ON vc.server_id = s.id
+                JOIN video v ON vc.video_id = v.id
+                WHERE v.filename = ? AND vc.chunk_id = ?;
+            """,
+            (file_stem, chunk_id),
+            fetch_type="one",
+        )
 
-    return jsonify(images), 200
+    server_dek = encrypter.decrypt(server_dek)
+    video_dek = encrypter.decrypt(video_dek)
 
-
-@app.route("/stream", methods=("GET",))
-def data():
-    filename = request.args.get("filename")
-    chunk = request.args.get("chunkIndex")
-    if chunk:  # if there's a chunk index then it's a video
-        filename = filename.replace(".webm", f"_{chunk.zfill(4)}.webm")
-
-    placeholder = request.args.get("placeholder")
-
-    mimetype = "video/webm" if filename.endswith("webm") else "image/jpeg"
-    if filename.endswith("_0000.webm") or (filename.endswith(".jpg") and placeholder):
-        return Response(download_from_disk(filename), mimetype=mimetype)
-
-    record = db_fetch(
-        """
-            select 
-                filename, 
-                files.email, 
-                mega_pw, 
-                servers.dek as server_dek, 
-                files.dek as data_dek
-            from files
-            inner join servers on servers.email = files.email
-            where filename=?
-        """,
-        (filename,),
-        fetch_type="one",
-    )
-
-    if not record:
-        return Response(status=204)
-
-    return Response(download_from_server(record), mimetype=mimetype)
-
-
-@app.after_request
-def after_request(response):
-    response.headers.add("Accept-Ranges", "bytes")
-    return response
-
-
-def get_chunk(byte1=None, byte2=None):
-    # full_path = "try2.mp4"
-    filename = "20240505_075545.mp40.ts"
-    # chunk = request.args.get('chunkIndex')
-
-    # filename = filename.replace('.webm', f'_{chunk.zfill(4)}.webm')
-    full_path = os.path.join(app.static_folder, filename)
-    file_size = os.stat(full_path).st_size
-    start = 0
-
-    if byte1 < file_size:
-        start = byte1
-    if byte2:
-        length = byte2 + 1 - byte1
-    else:
-        length = file_size - start
-
-    with open(full_path, "rb") as f:
-        f.seek(start)
-        chunk = f.read(length)
-    return chunk, start, length, file_size
-
-
-import re
-
-
-@app.route("/stream_test")
-def get_file():
-    range_header = request.headers.get("Range", None)
-    byte1, byte2 = 0, None
-    if range_header:
-        match = re.search(r"(\d+)-(\d*)", range_header)
-        groups = match.groups()
-
-        if groups[0]:
-            byte1 = int(groups[0])
-        if groups[1]:
-            byte2 = int(groups[1])
-
-    chunk, start, length, file_size = get_chunk(byte1, byte2)
-    resp = Response(
-        chunk,
-        206,
-        mimetype="video/mp4",
-        content_type="video/mp4",
-        direct_passthrough=True,
-    )
-    resp.headers.add(
-        "Content-Range",
-        "bytes {0}-{1}/{2}".format(start, start + length - 1, file_size),
-    )
-    return resp
-
-
-def download_from_disk(filename):
-    # the first chunk of the video is cached on disk for quick viewing
-    with open(os.path.join(app.static_folder, "previews", filename), "rb") as f:
-        while chunk := f.read(4096):
-            yield chunk
-
-
-def download_from_server(db_entry):
-    server_dek = encrypter.decrypt(db_entry["server_dek"])
-    data_dek = encrypter.decrypt(db_entry["data_dek"])
-    filename_hash = encrypter.hash(db_entry["filename"], data_dek)
+    filename_hash = encrypter.hash(filename, iv=video_dek)
+    upload_path = generate_upload_path(server_dek, timestamp, file_stem)
 
     command = [
         "megatools",
         "get",
-        # '--dryrun',
-        # '--no-progress',
         "--username",
-        db_entry["email"],
+        server_name,
         "--password",
-        encrypter.decrypt(db_entry["mega_pw"], iv=server_dek).decode("utf-8"),
+        encrypter.decrypt(server_password, iv=server_dek).decode("utf-8"),
         "--path",
         "-",
-        f"/Root/{filename_hash}",
+        f"/Root/{os.path.join(upload_path, filename_hash)}",
     ]
 
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=False) as process:
-        decryptor = encrypter.cipher(data_dek).decryptor()
-        while True:
-            line = process.stdout.read(1024)
-            if not line:
-                yield decryptor.finalize()
-                break
-            decrypted = decryptor.update(line)
-            yield decrypted
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=False)
+    decryptor = encrypter.cipher(video_dek).decryptor()
+
+    def generate():
+        try:
+            while True:
+                chunk = process.stdout.read(4096)  # Read in 4KB chunks
+                if not chunk:
+                    yield decryptor.finalize()
+                    break
+                yield decryptor.update(chunk)
+        finally:
+            process.kill()
+
+    return generate()
 
 
+app.register_blueprint(bp)
 if __name__ == "__main__":
-    app.run(debug=True, threaded=True)
+    app.run(debug=True)

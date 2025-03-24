@@ -34,7 +34,6 @@ dist/
 build/
 *.egg-info/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
