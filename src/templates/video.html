@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/video.js/8.22.0/video-js.min.css" rel="stylesheet" />
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
+        }
+        #video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            position: fixed;
+            top: 0;
+            left: 0;
+        }
+        .video-js .vjs-control-bar {
+            position: fixed;
+            bottom: 0;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/video.js/8.22.0/video.min.js"></script>
+    <video id="video" class="video-js vjs-default-skin" controls></video>
+    <script>
+        videojs.Vhs.GOAL_BUFFER_LENGTH = 60;
+        videojs.Vhs.MAX_GOAL_BUFFER_LENGTH = 80;
+
+        var player = videojs('video');
+        player.src({
+            src: '{{ url_for("homevids.video", filename="") }}' + '{{ filestem }}.m3u8',
+            type: 'application/x-mpegURL'
+        });
+        player.play();
+    </script>
+</body>
+</html>

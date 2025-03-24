@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Photos</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    <style>
+        body {
+            background-color: #222;
+        }
+
+        .placeholderSquare {
+            border: 1px solid #666;
+            width: 256px;
+            height: 192px;
+            display: inline-block;
+        }
+        
+        .thumbnail {
+            margin-left: 5px;
+            max-width: calc(50% - 5px);
+        }
+        .thumbnail:hover {
+            cursor: pointer;
+        }
+            
+        #video, #image {
+            position: relative;
+            max-width: 100%;
+            max-height: 100vh;
+            width: auto;
+            height: auto;
+        }
+        #overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+
+        #overlay.hidden {
+            display: none;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            margin: 0 auto;
+            border-radius: 50%;
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #7986cb;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        h1 {
+            color: white;
+            font-family: 'Gill Sans', 'Gill Sans MT', Calibri, 'Trebuchet MS', sans-serif;
+        }
+
+        h1::after {
+            content: '';
+            display: block;
+            width: 100%;
+            height: 2px;
+            background-color: gray;
+            bottom: 0;
+            left: 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay" class="hidden">
+        <div id="spinner" class="spinner"></div>
+        <video id="video" class="hidden" controls></video>
+        <image id="image" class="hidden"></image>
+    </div>
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            let startY;
+            const closeOverlay = function() {
+                document.getElementById('overlay').classList.add('hidden');
+                document.getElementById('image').src = '';
+                document.getElementById('spinner').style.display = "block";
+                document.body.style.overflow = 'auto';
+            }
+            
+            const overlay = document.getElementById("overlay");
+            overlay.addEventListener("mousedown", function(e) {
+                closeOverlay();
+            })
+
+            const image = document.getElementById("image");
+            image.addEventListener('touchstart', (e) => {
+                startY = e.touches[0].clientY;
+            });
+
+            image.addEventListener('touchmove', (e) => {
+                const deltaY = e.touches[0].clientY - startY;
+                if (deltaY < 0) {
+                    image.style.transition = null;
+                    image.style.transform = `translateY(${deltaY}px)`;
+                }
+            });
+
+            image.addEventListener('touchend', (e) => {
+                const deltaY = e.changedTouches[0].clientY - startY;
+                if (deltaY < -150) {
+                    closeOverlay();
+                } else {
+                    // Reset position
+                    image.style.transition = 'transform 0.3s ease';
+                    image.style.transform = 'translateY(0)';
+                }
+            });
+        });
+
+        async function loadVideo(filename) {
+            document.getElementById('spinner').style.display = "none";
+            const mediaSource = new MediaSource();
+            let sourceBuffer = null;
+            
+            let lastChunkLoaded = false;
+            let chunkIndex = 0;
+            let currentChunk = 0;
+
+            video.src = URL.createObjectURL(mediaSource);
+            
+            mediaSource.addEventListener('sourceopen', async () => {
+                const mimeCodec = 'video/webm; codecs="vp9, opus"';
+                if (!MediaSource.isTypeSupported(mimeCodec)) {
+                    console.error('Unsupported MIME type or codec:', mimeCodec);
+                    return;
+                }
+
+                sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
+                const appendBuffer = async (buffer) => {
+                    return new Promise((resolve, reject) => {
+                        sourceBuffer.addEventListener('updateend', resolve, { once: true });
+                        sourceBuffer.addEventListener('error', (e) => {
+                            console.error("srcubf error:", e)
+                            reject(e)
+                        }, { once: true });
+
+                        try {
+                            sourceBuffer.appendBuffer(buffer);
+                        }
+                        catch (e) {
+                            console.error("appendBuffer exc: ", e)
+                            reject(e)
+                        }
+                    });
+                };
+
+                const loadNextChunk = async () => {
+                    if (lastChunkLoaded) return;
+
+                    const response = await fetch(`/stream?filename=${filename}&chunkIndex=${chunkIndex}`);                    
+                    if (response.status === 204) {
+                        lastChunkLoaded = true;
+                        mediaSource.endOfStream();
+                        return;
+                    }
+
+                    const reader = response.body.getReader();
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) {
+                            if (value) await appendBuffer(value);
+                            chunkIndex++;
+                            break;
+                        }
+                        if (value) await appendBuffer(value);
+                    }
+                };
+
+                await loadNextChunk();
+
+                video.addEventListener('timeupdate', async () => {
+                    if (!lastChunkLoaded && currentChunk < chunkIndex && video.buffered.length && video.buffered.end(0) - video.currentTime < 10) {
+                        currentChunk = chunkIndex;
+                        await loadNextChunk();
+                    }
+                });
+
+                video.addEventListener('error', (e) => {
+                    console.error('Video error:', e);
+                });
+            });
+        }
+
+        async function streamImage(filename, placeholder=false) {
+            let fetchUrl = `/stream?filename=${filename}`;
+            if (placeholder)
+                fetchUrl += '&placeholder=true';
+            const response = await fetch(fetchUrl);
+            const reader = response.body.getReader();
+            const chunks = [];
+
+            return reader.read().then(function processChunk({ done, value }) {
+                if (done) {
+                    const blob = new Blob(chunks, { type: 'image/jpeg' });
+                    return URL.createObjectURL(blob);
+                }
+
+                chunks.push(value);
+                return reader.read().then(processChunk);
+            });
+        }
+
+        async function loadImage(filename) {
+            const img = document.getElementById("image");
+
+            // Load placeholder
+            img.src = await streamImage(filename, true);
+            document.getElementById('spinner').style.display = "none";
+
+            // Load high-quality image
+            const highQualityUrl = await streamImage(filename);
+            img.src = highQualityUrl;
+        }
+    </script>
+    
+    <div id="grid"></div>
+    <script>
+        function buildSkele(val) {
+            const grid = document.getElementById('grid');
+
+            Object.keys(val).forEach(key => {
+                for (let ele of val[key]) {
+                    Object.keys(ele).forEach(dt => {
+                        const dateGroup = document.createElement("div");
+                        dateGroup.setAttribute("data-date", dt);
+                        
+                        for (let i = 0; i < ele[dt]; ++i) {
+                            const square = document.createElement("div");
+                            square.classList.add("placeholderSquare", "thumbnail");
+                            dateGroup.prepend(square);
+                        }
+                        
+                        const h = document.createElement("h1")
+                        h.textContent = new Date(dt).toLocaleDateString("en-us", {
+                            year: 'numeric', 
+                            month: 'long', 
+                            day: 'numeric' 
+                        })
+                        dateGroup.prepend(h)
+
+                        grid.prepend(dateGroup);
+
+                        dateGroup.querySelectorAll(".placeholderSquare")
+                            .forEach(el => observer.observe(el))
+                    })
+                }
+            });
+        }
+        
+        async function buildSkeleByYear(years) {
+            for (let year of years) {
+                await fetch(`/files_by_day?year=${year}`)
+                    .then(response => response.json())
+                    .then(data => buildSkele(data))
+            }
+        }
+        
+        fetch('/distinct_years')
+            .then(response => response.json())
+            .then(years => buildSkeleByYear(years))
+            // .then(() => fetchThumbnails())
+
+        function fetchThumbnails(squares) {
+            // TODO
+            // pass the actual squares list into here
+            // and calc the args from them
+            // then we can loop through and assign the response images
+
+            const tuples = [];
+            squares.forEach(element => {
+                const parent = element.parentElement;
+                const placeholderSquares = parent.getElementsByClassName("thumbnail")
+
+                tuples.push(
+                    [parent.getAttribute("data-date"), Array.from(placeholderSquares).indexOf(element), element]
+                );
+            });
+
+            // because the squares are in descending order, the highest date is at the top of the screen.
+            // however, we want the first visible square from that date, so its highest date, smallest index
+            tuples.sort((a, b) => {
+                if (b[0] < a[0]) return -1;
+                if (b[0] > a[0]) return 1;
+                return a[1] - b[1];
+            });
+
+            let query = `/thumbnails?targetDate=${tuples[0][0]}&fromIndex=${tuples[0][1]}&limit=${tuples.length}`;
+            
+            fetch(query)
+            .then(response => response.json())
+            .then(data => {
+                const grid = document.getElementById('grid');
+
+                console.log(data);
+                console.log(tuples.length)
+                for (let i = 0; i < tuples.length; ++i) {
+                        const filename = data[i][0];
+                        const file = data[i][1];
+                        
+                        const img = document.createElement('img');
+                        img.id = filename;
+                        img.src = `data:image/jpeg;base64,${file}`;
+                        img.classList.add("thumbnail")
+                        img.title = filename;
+                        img.onclick = function() {
+                            document.getElementById('overlay').classList.remove('hidden');
+                            document.body.style.overflow = "hidden";
+                            const vid = document.getElementById('video');
+                            const img = document.getElementById('image');
+    
+                            if (this.title.endsWith("webm")) {
+                                vid.style.display = "block";
+                                img.style.display = "none";
+                                loadVideo(this.title);
+                            } else {
+                                vid.style.display = "none";
+                                img.style.display = "block";
+                                loadImage(this.title);
+                            }
+                        }
+                        observer.unobserve(tuples[i][2]);
+
+                        const dateGroup = tuples[i][2].parentElement;
+                        dateGroup.replaceChild(img, tuples[i][2]);
+                }
+
+
+                return Object.keys(data).length > 0;
+            })
+        }
+
+        let intersectingElements = [];
+        let timeoutId = null;
+        let observer = new IntersectionObserver((entries, observer) => {
+            // console.log(entries);
+            entries.forEach(entry => {
+                if (entry.intersectionRatio > 0) {
+                    intersectingElements.push(entry.target);
+                }
+            })
+
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+            }
+
+            timeoutId = setTimeout(() => {
+                intersectingElements = intersectingElements.filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        el.classList.contains("placeholderSquare") && 
+                        el.parentElement && // if it's been replaced by an image then it won't have a parent anymore
+                        rect.top < window.innerHeight &&
+                        rect.bottom >= 0 &&
+                        rect.left < window.innerWidth &&
+                        rect.right >= 0
+                    );
+                });
+
+                fetchThumbnails(intersectingElements);
+
+                // const data = [];
+                // intersectingElements.forEach(element => {
+                //     const parent = element.parentElement;
+                //     const placeholderSquares = parent.getElementsByClassName("placeholderSquare")
+
+                //     data.push({
+                //         [parent.getAttribute("data-date")]: Array.from(placeholderSquares).indexOf(element)
+                //     });
+                // });
+
+                // console.log(data);
+
+                // const lowestIndexInHighestDate = data.reduce((acc, obj) => {
+                //     const [date, index] = Object.entries(obj)[0];
+                //     if (!acc.date || date > acc.date || (date === acc.date && index < acc.index)) {
+                //         acc = { date, index };
+                //     }
+                //     return acc;
+                // }, {});
+
+                // console.log("Lowest index in highest date:", lowestIndexInHighestDate);
+
+                // TODO retrieve data.length entries from the lowestIndexInHighestDate.index'th position
+                // fetchThumbnails(lowestIndexInHighestDate.date, lowestIndexInHighestDate.index, intersectingElements.length)
+
+
+                intersectingElements = [];
+            }, 500);
+            
+            // entries.forEach(entry => {
+            //     if (entry.intersectionRatio > 0) {
+            //         const parent = entry.target.parentElement;
+            //         const placeholderSquares = parent.getElementsByClassName("placeholderSquare")
+
+            //         setTimeout(() => {
+            //             const rect = entry.target.getBoundingClientRect();
+            //             const stillIntersecting = (
+            //                 rect.top < window.innerHeight &&
+            //                 rect.bottom >= 0 &&
+            //                 rect.left < window.innerWidth &&
+            //                 rect.right >= 0
+            //             );
+
+            //             if (stillIntersecting){
+            //                 console.log(parent.getAttribute("data-date") + ": " + Array.from(placeholderSquares).indexOf(entry.target))
+            //             }
+            //         }, 500);
+                    
+            //         // observer.unobserve(entry.target);
+            //         // fetchThumbnails(since=entry.target.title);
+            //     }
+            // })
+        })
+    </script>
+</body>
+</html>

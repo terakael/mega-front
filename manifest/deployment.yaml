@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mega-front
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mega-front
+  template:
+    metadata:
+      labels:
+        app: mega-front
+    spec:
+      containers:
+        - name: mega-front
+          image: docker.io/terakael/zsaqic:0.0.8
+          ports:
+            - containerPort: 5000
+          command: ["gunicorn"]
+          args: ["-w", "2", "-b", "0.0.0.0:5000", "app:app"]
+          volumeMounts:
+            - name: static-volume
+              mountPath: /app/static
+            - name: templates-volume
+              mountPath: /app/templates
+            - name: kek
+              mountPath: /etc/secrets/kek
+              readOnly: true
+      volumes:
+        - name: static-volume
+          hostPath:
+            path: /media/seagate/flask-static/mega/static
+            type: Directory
+        - name: templates-volume
+          hostPath:
+            path: /media/seagate/flask-static/mega/templates
+            type: Directory
+        - name: kek
+          secret:
+            secretName: vids-kek
