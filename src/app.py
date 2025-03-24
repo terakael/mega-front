@@ -13,7 +13,6 @@ from flask import (
     render_template,
     send_from_directory,
     request,
-    Response,
 )
 
 # from dotenv import load_dotenv
@@ -46,25 +45,10 @@ def video(filename):
         print(f"pulled file {filename} from cache")
         return send_from_directory(cached_file_location, filename)
 
-    # Handle range requests for streaming
-    range_header = request.headers.get("Range")
-    file_size = None  # Will need to get actual size if possible
+    file_bytes = download_from_server(filename)
+    buffer = io.BytesIO(file_bytes)
 
-    # Get streaming response from download_from_server
-    response = Response(
-        download_from_server(filename),
-        status=206 if range_header else 200,
-        mimetype=(
-            "application/x-mpegURL" if filename.endswith(".m3u8") else "video/MP2T"
-        ),
-        direct_passthrough=True,
-    )
-
-    response.headers["Accept-Ranges"] = "bytes"
-    if range_header and file_size:
-        response.headers["Content-Range"] = f"bytes 0-{file_size-1}/{file_size}"
-
-    return response
+    return send_file(buffer, mimetype="application/x-mpegURL")
 
 
 def _images_including_people(cursor, selected_names, per_page, offset):
@@ -280,21 +264,15 @@ def download_from_server(filename):
         f"/Root/{os.path.join(upload_path, filename_hash)}",
     ]
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=False)
-    decryptor = encrypter.cipher(video_dek).decryptor()
-
-    def generate():
-        try:
-            while True:
-                chunk = process.stdout.read(4096)  # Read in 4KB chunks
-                if not chunk:
-                    yield decryptor.finalize()
-                    break
-                yield decryptor.update(chunk)
-        finally:
-            process.kill()
-
-    return generate()
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=False) as process:
+        decryptor = encrypter.cipher(video_dek).decryptor()
+        file_bytes = []
+        while True:
+            line = process.stdout.read()
+            if not line:
+                file_bytes.append(decryptor.finalize())
+                return b"".join(file_bytes)
+            file_bytes.append(decryptor.update(line))
 
 
 app.register_blueprint(bp)
